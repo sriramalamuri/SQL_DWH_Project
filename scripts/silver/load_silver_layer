@@ -1,0 +1,222 @@
+Create Or Replace Procedure silver.load_silver()
+Language plpgsql
+As $$
+Declare
+	starttime timestamp;
+	endtime timestamp;
+	batchstart timestamp;
+	batchend timestamp;
+Begin
+	batchstart := now();
+	-- 1 cust_info table: data cleaning and standardization
+	-- 2 inserting this cleaned data in to silver.crm_cust_info;	
+		starttime := now();
+		Raise Notice 'truncating silver.crm_cust_info before insert';
+		If to_regclass('silver.crm_cust_info') IS NOT NULL Then
+			Truncate Table silver.crm_cust_info;
+		End If;
+		Raise Notice 'inserting into silver.crm_cust_info';
+	Insert Into silver.crm_cust_info(
+		cst_id,
+		cst_key,
+		cst_firstname,
+		cst_lastname,
+		cst_marital_status,
+		cst_gndr,
+		cst_create_date
+	)	
+	Select
+		cst_id,
+		cst_key,
+		Trim(cst_firstname) as cst_firstname, -- Remvoing blanks from first name
+		Trim(cst_lastname) as cst_lastname, -- Removing blanks from last name
+		Case -- Standardizing the marital status identifier using Case/When
+			When Upper(Trim(cst_marital_status)) = 'S' Then 'Single'
+			When Upper(Trim(cst_marital_status)) = 'M' Then 'Married'
+			Else 'n/a'
+		End cst_marital_Status, 
+		Case -- Standardizing the gender identifier using Case/When
+			When Upper(Trim(cst_gndr)) = 'F' Then 'Female'
+			When Upper(Trim(cst_gndr)) = 'M' Then 'Male'
+			Else 'n/a'
+		End cst_gndr, 
+		cst_create_date
+	 From -- subquery to remove duplicate rows
+	 (Select *,
+		Row_number() Over (Partition By cst_id Order by cst_create_date DESC) as flag_last
+		From bronze.crm_cust_info
+		Where cst_id IS NOT NULL
+		)t Where flag_last = 1;
+		endtime := now();
+		Raise Notice 'Duration of insert to silver.crm_cust_info table is %', endtime - starttime;
+	
+	--===========================================================
+	-- Inserting cleaned data into crm_prd_info
+	--===========================================================
+	starttime := now();
+		Raise Notice 'truncating table before insert';
+		If to_regclass('silver.crm_prd_info') Is Not NULL Then
+		Truncate Table silver.crm_prd_info;
+		End if;
+	Raise Notice 'inserting into silver.crm_prd_info';
+	Insert into silver.crm_prd_info(
+	prd_id,
+	cat_id,
+	prd_key,
+	prd_nm,
+	prd_cost,
+	prd_line,
+	prd_start_dt,
+	prd_end_dt
+	)
+	select 
+	prd_id,
+	Replace(Substring(prd_key,1,5), '-', '_') cat_id,
+	Substring(prd_key, 7, length(prd_key)) prd_key, 
+	prd_nm,
+	Coalesce(prd_cost, 0) as prd_cost,
+	Case Upper(Trim(prd_line))
+		When 'M' Then 'Mountain'
+		When 'R' Then 'Road'
+		When 'S' Then 'Other Sales'
+		When 'T' Then 'Touring'
+		Else 'n/a'
+	End prd_line,
+	prd_start_dt,
+	lead(prd_start_dt) over(Partition By prd_key order by prd_start_dt) - 1 as prd_end_dt
+	from bronze.crm_prd_info;
+	endtime := now();
+	Raise Notice 'Duration of insert to silver.crm_prd_info is %', endtime - starttime;	
+	--===============================================
+	-- Inserting cleaned data into crm_sales_details
+	--===============================================
+	starttime := now();
+		Raise Notice 'Truncating table before insert';
+		If to_regclass('silver.crm_sales_details') Is Not NULL Then
+		Truncate Table silver.crm_sales_details;
+		End If;
+	Raise Notice 'inserting into silver.crm_sales_details';
+	Insert into silver.crm_sales_details(
+	sls_ord_num,
+	sls_prd_key,
+	sls_cust_id,
+	sls_order_dt,
+	sls_ship_dt,
+	sls_due_dt,
+	sls_sales,
+	sls_quantity,
+	sls_price
+	)
+	Select 
+	sls_ord_num,
+	sls_prd_key,
+	sls_cust_id,
+	Case 
+		When sls_order_dt <=0 or length(cast(sls_order_dt as Varchar(50))) != 8 Then Null
+		Else Cast(Cast(sls_order_dt as Varchar(50)) as Date)
+		End sls_order_dt, 
+	Case 
+		When sls_ship_dt <=0 or length(cast(sls_ship_dt as Varchar(50))) != 8 Then Null
+		Else Cast(Cast(sls_ship_dt as Varchar(50)) as Date)
+		End sls_ship_dt, 
+	Case 
+		When sls_due_dt <=0 or length(cast(sls_due_dt as Varchar(50))) != 8 Then Null
+		Else Cast(Cast(sls_due_dt as Varchar(50)) as Date)
+		End sls_due_dt, 
+	Case
+		When sls_sales IS NULL OR sls_sales <=0 OR sls_sales != sls_quantity * ABS(sls_price)
+		Then sls_quantity * ABS(sls_price)
+		Else sls_sales
+	End sls_sales,
+	sls_quantity,
+	Case
+		When sls_price IS NULL OR sls_price <=0
+		Then sls_sales / NULLIF(sls_quantity,0)
+		Else sls_price
+	End sls_price
+	From bronze.crm_sales_details;
+	endtime := now();
+	Raise Notice 'Duration of insert into silver.crm_sales_Details is %', endtime - starttime;	
+	--=====================================================
+	-- Inserting cleaned data into silver.erp_cust_az12
+	--====================================================
+	starttime := now();
+		Raise Notice 'Truncating table before insert';
+		If to_regclass('silver.erp_cust_az12') Is Not Null Then
+		Truncate Table silver.erp_cust_az12;
+		End If;
+	Raise Notice 'Insert into table silver.erp_cust_az12';
+	Insert Into silver.erp_cust_az12 (
+	cid,
+	bdate,
+	gen
+	)
+	Select
+	Case
+		When cid Like 'NAS%' Then Substring(cid,4,Length(cid))
+		Else cid
+	End cid,
+	Case
+		When bdate > now() Then NULL
+		Else bdate
+	End bdate,
+	Case
+		When Upper(Trim(gen)) = 'F' Then 'Female'
+		When Upper(Trim(gen)) = 'M' Then 'Male'
+		Else 'n/a'
+	End gen
+	From bronze.erp_cust_az12;
+	endtime := now();
+	Raise Notice 'Duration of insert into table silver.rp_cust_az12 is %', endtime - starttime;
+	--===========================================
+	-- Insert into silver.erp_loc_a101
+	--===========================================
+	starttime := now();
+		Raise Notice 'Truncating table before insert';
+		If to_regclass('silver.erp_loc_a101') Is Not Null Then
+		Truncate Table silver.erp_loc_a101;
+		End If;
+	Raise Notice 'Inserting into table silver.erp_loc_a101';
+	Insert into silver.erp_loc_a101(
+	cid,
+	cntry
+	)
+	Select
+	replace(cid,'-','') cid,
+	Case 
+		When Trim(cntry) = 'DE' then 'Germany'
+		When Trim(cntry) IN ('US', 'USA') then 'United States'
+		When Trim(cntry) = '' or cntry IS NULL Then 'n/a'
+		Else Trim(cntry)
+	End cntry
+	From bronze.erp_loc_a101;
+	endtime := now();
+	Raise notice 'Duration of insert into silver.erp_loc_a101 is %', endtime - starttime;
+	
+	--=================================================
+	-- Insert cleaned data into silver.erp_px_cat_g1v2
+	--=================================================
+	starttime := now();
+		Raise Notice 'Truncate table before insert';
+		If to_regclass('silver.erp_px_Cat_g1v2') Is Not Null Then
+		Truncate Table silver.erp_px_cat_g1v2;
+		End If;
+	Raise Notice 'Insert into table silver.erp_px_cat_g1v2';
+	Insert Into silver.erp_px_cat_g1v2(
+	id_,
+	cat,
+	subcat,
+	maintenance
+	)
+	select
+	id_,
+	cat,
+	subcat,
+	maintenance
+	From bronze.erp_px_cat_g1v2;
+	endtime := now();
+	Raise Notice 'Duration of insert into table silver.erp_px_cat_g1v2 is %', endtime - starttime;
+batchend := now();
+Raise Notice 'Duration of batch process is %', batchend - batchstart;
+End;
+$$;
